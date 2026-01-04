@@ -1,10 +1,11 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
-import { Upload, Loader2, Play, Wand2, Layers, Image as ImageIcon, Sliders, Maximize2, X, RefreshCcw, Palette, Key, Eye, EyeOff, Download, FileJson, ImageIcon as ImageIconLucide, Move3d, RotateCw } from 'lucide-react';
+import { Upload, Loader2, Play, Wand2, Layers, Image as ImageIcon, Sliders, Maximize2, X, RefreshCcw, Palette, Key, Eye, EyeOff, Download, FileJson, ImageIcon as ImageIconLucide, Move3d, RotateCw, Box, Zap, Code, BrainCircuit } from 'lucide-react';
 import PointCloudViewer from './components/PointCloudViewer';
+import VoxelViewer from './components/VoxelViewer';
 import HandController, { HandControllerHandle } from './components/HandController';
-import { generateDepthMap } from './services/geminiService';
+import { generateDepthMap, generateVoxelScene } from './services/geminiService';
 import { loadImage, resizeImage, generatePointCloudFromImages, applyColorMap } from './utils/imageProcessing';
-import { ProcessedPointCloud, HandGestures } from './types';
+import { ProcessedPointCloud, HandGestures, ViewMode } from './types';
 
 // Add type definition for the AI Studio window object by augmenting the expected interface
 declare global {
@@ -21,14 +22,24 @@ function App() {
   const [pointCloudData, setPointCloudData] = useState<ProcessedPointCloud | null>(null);
   const [showDepthOverlay, setShowDepthOverlay] = useState(false);
   
+  // Generative Scene State
+  const [voxelSceneHtml, setVoxelSceneHtml] = useState<string | null>(null);
+  const [isGeneratingScene, setIsGeneratingScene] = useState(false);
+  const [sceneThought, setSceneThought] = useState<string>("");
+
   const [isGenerating, setIsGenerating] = useState(false);
   const [isProcessing3D, setIsProcessing3D] = useState(false);
   const [statusMessage, setStatusMessage] = useState<string>("");
   const [progress, setProgress] = useState<number>(0);
 
+  // Mode Selection
+  const [viewMode, setViewMode] = useState<ViewMode>('points');
+
   // Visual settings
   const [pointSize, setPointSize] = useState<number>(0.2); // Default to 0.2
   const [samplingDensity, setSamplingDensity] = useState<number>(0.5); // Default to 50%
+  const [voxelResolution, setVoxelResolution] = useState<number>(64); // Reduced to 64 for safety
+
   const [showBackground, setShowBackground] = useState<boolean>(false);
   const [depthExaggeration, setDepthExaggeration] = useState<number>(1.0);
   const [autoRotate, setAutoRotate] = useState<boolean>(false);
@@ -55,6 +66,7 @@ function App() {
   
   const handControllerRef = useRef<HandControllerHandle>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const iframeRef = useRef<HTMLIFrameElement>(null); // Reference to Gen Scene iframe
 
   // Check for API Key on mount
   useEffect(() => {
@@ -63,8 +75,6 @@ function App() {
             const hasKey = await window.aistudio.hasSelectedApiKey();
             setIsApiKeyReady(hasKey);
         } else {
-            // If we are not in the AI Studio environment, we assume the user 
-            // might provide it manually or via env. We don't block immediately unless generation fails.
             setIsApiKeyReady(true);
         }
     };
@@ -80,7 +90,16 @@ function App() {
 
   const handleHandUpdate = useCallback((gestures: HandGestures) => {
     gestureRef.current = gestures;
-  }, []);
+
+    // Send Gestures to IFrame if in Scene Mode
+    if (viewMode === 'scene' && iframeRef.current && iframeRef.current.contentWindow) {
+        iframeRef.current.contentWindow.postMessage({
+            type: 'gesture',
+            data: gestures
+        }, '*');
+    }
+
+  }, [viewMode]);
 
   const handleResetView = () => {
      setResetTrigger(prev => prev + 1);
@@ -106,6 +125,7 @@ function App() {
           setDepthImage(null);
           setDisplayDepthImage(null);
           setPointCloudData(null);
+          setVoxelSceneHtml(null); // Reset scene
           setStatusMessage("Image loaded.");
         }
       };
@@ -133,9 +153,14 @@ function App() {
                   
                   setOriginalImage(data.originalImage);
                   setDepthImage(data.depthImage);
+
+                  // Restore View Mode if present
+                  if (data.settings && data.settings.viewMode) {
+                      setViewMode(data.settings.viewMode);
+                  }
                   
                   // Rebuild point cloud immediately
-                  await buildPointCloud(data.originalImage, data.depthImage, samplingDensity);
+                  await build3DModel(data.originalImage, data.depthImage);
                   
                   setStatusMessage("Cloud imported successfully.");
               } else {
@@ -151,13 +176,27 @@ function App() {
   };
 
   const handleExport = () => {
+      if (viewMode === 'scene') {
+          if (!voxelSceneHtml) return;
+          const blob = new Blob([voxelSceneHtml], { type: 'text/html' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `voxel-scene-${Date.now()}.html`;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+          return;
+      }
+
       if (!originalImage || !depthImage) return;
 
       const data = {
           originalImage,
           depthImage,
           createdAt: new Date().toISOString(),
-          settings: { pointSize, samplingDensity }
+          settings: { pointSize, samplingDensity, viewMode }
       };
 
       const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
@@ -177,7 +216,6 @@ function App() {
      
      const updateDisplay = async () => {
          const img = await loadImage(depthImage);
-         // Resize for display to avoid lag with massive images
          const canvas = resizeImage(img, 512); 
          
          const tempImg = new Image();
@@ -193,12 +231,18 @@ function App() {
   const processGeneration = async () => {
     if (!originalImage) return;
 
-    // Reset progress and start simulation
+    const hasKey = manualApiKey || process.env.API_KEY || (window.aistudio && await window.aistudio.hasSelectedApiKey());
+    if (!hasKey) {
+        setStatusMessage("Missing API Key");
+        setShowApiKey(true);
+        if (window.aistudio) setIsApiKeyReady(false);
+        return;
+    }
+
     setProgress(5);
     const progressInterval = setInterval(() => {
         setProgress(prev => {
-            if (prev >= 85) return prev; // Hold at 85% while waiting for API
-            // Decelerating progress
+            if (prev >= 85) return prev;
             const increment = prev < 50 ? 5 : prev < 70 ? 2 : 0.5;
             return prev + Math.random() * increment;
         });
@@ -206,49 +250,80 @@ function App() {
 
     try {
       setIsGenerating(true);
-      setStatusMessage("Analysing depth (Gemini 3 Pro)...");
+      setStatusMessage("AI is analyzing depth..."); 
       
       const base64Data = originalImage.split(',')[1];
-      // Pass the manual key if it exists
       const depthBase64 = await generateDepthMap(base64Data, manualApiKey);
       
       if (!depthBase64) throw new Error("Failed to generate depth map");
 
-      // Bump progress to indicate API success
       setProgress(90);
 
       const fullDepthSrc = `data:image/png;base64,${depthBase64}`;
       setDepthImage(fullDepthSrc);
-      setStatusMessage("Constructing high-res cloud...");
+      setStatusMessage(viewMode === 'points' ? "Constructing Cloud..." : "Voxelizing...");
       
-      await buildPointCloud(originalImage, fullDepthSrc, samplingDensity);
+      await build3DModel(originalImage, fullDepthSrc);
       
-      // Done
       setProgress(100);
+      setStatusMessage("Generated with Gemini.");
       
     } catch (error: any) {
       console.error(error);
       const errMsg = error.toString();
       
-      // Handle Permission/Auth Errors
       if (errMsg.includes("403") || errMsg.includes("PERMISSION_DENIED")) {
          setStatusMessage("Access Denied. Check API Key.");
-         // If we are in AI Studio, trigger that flow, otherwise rely on manual input
-         if (window.aistudio) {
-             setIsApiKeyReady(false);
-         }
+         if (window.aistudio) setIsApiKeyReady(false);
       } else {
          setStatusMessage("Error: " + (error instanceof Error ? error.message : "Unknown error"));
       }
-      setProgress(0); // Reset on error
+      setProgress(0); 
     } finally {
       clearInterval(progressInterval);
       setIsGenerating(false);
-      // Wait a moment before clearing progress visually if needed, but react state update will hide overlay
     }
   };
 
-  const buildPointCloud = async (colorSrc: string, depthSrc: string, density: number) => {
+  const processSceneGeneration = async () => {
+     if (!originalImage) return;
+
+     const hasKey = manualApiKey || process.env.API_KEY || (window.aistudio && await window.aistudio.hasSelectedApiKey());
+     if (!hasKey) {
+         setStatusMessage("Missing API Key");
+         setShowApiKey(true);
+         if (window.aistudio) setIsApiKeyReady(false);
+         return;
+     }
+     
+     setIsGeneratingScene(true);
+     setStatusMessage("AI is analyzing..."); 
+     setSceneThought("Analyzing image composition...");
+     setVoxelSceneHtml(null);
+     
+     try {
+         const { html, modelUsed } = await generateVoxelScene(originalImage, manualApiKey, (thought) => {
+             // Keep thought box tidy, remove formatting symbols
+             const cleanThought = thought.replace(/\*\*/g, '').replace(/###/g, '').trim();
+             setSceneThought(cleanThought);
+         });
+         setVoxelSceneHtml(html);
+         setStatusMessage(`Generated with ${modelUsed}`);
+     } catch (error: any) {
+        console.error(error);
+        setStatusMessage("Scene generation failed.");
+        const errMsg = error.toString();
+        if (errMsg.includes("403") || errMsg.includes("PERMISSION_DENIED")) {
+             if (window.aistudio) setIsApiKeyReady(false);
+        }
+     } finally {
+         setIsGeneratingScene(false);
+         setSceneThought("");
+     }
+  };
+
+  // Generalized Builder that respects View Mode
+  const build3DModel = async (colorSrc: string, depthSrc: string) => {
     setIsProcessing3D(true);
     try {
       const [colorImg, depthImg] = await Promise.all([
@@ -256,32 +331,51 @@ function App() {
         loadImage(depthSrc)
       ]);
 
-      const colorCanvas = resizeImage(colorImg, 1024);
-      const depthCanvas = resizeImage(depthImg, 1024);
+      const targetRes = viewMode === 'voxels' ? voxelResolution : 1024;
+      const density = viewMode === 'voxels' ? 1.0 : samplingDensity; 
 
-      const cloud = generatePointCloudFromImages(colorCanvas, depthCanvas, density);
+      const colorCanvas = resizeImage(colorImg, targetRes);
+      const depthCanvas = resizeImage(depthImg, targetRes);
+
+      const cloud = generatePointCloudFromImages(colorCanvas, depthCanvas, density, viewMode === 'voxels');
       setPointCloudData(cloud);
-      setStatusMessage(`Ready (${(cloud.count / 1000).toFixed(0)}k points).`);
+      setStatusMessage(`Ready (${(cloud.count / 1000).toFixed(0)}k ${viewMode === 'voxels' ? 'voxels' : 'points'}).`);
     } catch (error) {
        console.error("3D Build Error", error);
-       setStatusMessage("Error building cloud.");
+       setStatusMessage("Error building model.");
     } finally {
       setIsProcessing3D(false);
     }
   };
 
-  const handleDensityChange = (newDensity: number) => {
-    setSamplingDensity(newDensity);
+  // When Mode changes, re-build logic is needed if data exists
+  const switchMode = (mode: ViewMode) => {
+      setViewMode(mode);
+      if (mode === 'scene') return; 
+
+      if (originalImage && depthImage) {
+           // Wait a tick for state to update
+      }
   };
 
+  useEffect(() => {
+      if (viewMode === 'scene') return;
+      if (originalImage && depthImage) {
+           const timer = setTimeout(() => {
+               build3DModel(originalImage, depthImage);
+           }, 50);
+           return () => clearTimeout(timer);
+      }
+  }, [viewMode, voxelResolution]); 
+
   const commitDensityChange = () => {
-    if (originalImage && depthImage) {
-        buildPointCloud(originalImage, depthImage, samplingDensity);
+    if (originalImage && depthImage && viewMode === 'points') {
+        build3DModel(originalImage, depthImage);
     }
   };
 
   // ----------------------------------------------------------------------
-  // RENDER: API Key Selection Screen (Only if strictly enforced by AI Studio)
+  // RENDER: API Key Selection Screen 
   // ----------------------------------------------------------------------
   if (!isApiKeyReady && window.aistudio) {
     return (
@@ -346,7 +440,7 @@ function App() {
                  </button>
                  {originalImage && (
                     <button 
-                        onClick={() => { setOriginalImage(null); setDepthImage(null); setPointCloudData(null); }}
+                        onClick={() => { setOriginalImage(null); setDepthImage(null); setPointCloudData(null); setVoxelSceneHtml(null); }}
                         className="text-[10px] text-zinc-500 hover:text-white transition-colors"
                     >
                         Clear
@@ -385,119 +479,210 @@ function App() {
             </div>
           </div>
 
-          {/* 2. Generation Control */}
-          <div className="space-y-2">
+          {/* 2. MODE SWITCHER */}
+          <div className="bg-zinc-900 p-1 rounded-lg flex gap-1 border border-zinc-800">
             <button
-                onClick={processGeneration}
-                disabled={!originalImage || isGenerating || !!pointCloudData}
-                className={`
-                    w-full py-2.5 rounded-lg text-sm font-medium flex items-center justify-center gap-2 transition-all duration-300
-                    ${!originalImage 
-                    ? 'bg-zinc-800 text-zinc-600 cursor-not-allowed' 
-                    : isGenerating 
-                        ? 'bg-zinc-800 text-zinc-300 cursor-wait'
-                        : !!pointCloudData
-                            ? 'bg-zinc-800 text-zinc-400 border border-zinc-700'
-                            : 'bg-white text-black hover:bg-blue-50 shadow-lg shadow-white/5 hover:scale-[1.02] active:scale-[0.98]'
-                    }
+                onClick={() => switchMode('points')}
+                className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-md text-[10px] font-semibold transition-all
+                    ${viewMode === 'points' 
+                        ? 'bg-zinc-800 text-white shadow-sm border border-zinc-700' 
+                        : 'text-zinc-500 hover:text-zinc-400 hover:bg-zinc-800/50'}
                 `}
             >
-                {isGenerating ? (
-                <Loader2 className="animate-spin" size={14} />
-                ) : !!pointCloudData ? (
-                    <> <Layers size={14} /> Generated </>
-                ) : (
-                    <> <Wand2 size={14} /> Generate 3D Model </>
-                )}
+                <Zap size={12} className={viewMode === 'points' ? "text-blue-500" : ""} /> Cloud
             </button>
+            <button
+                onClick={() => switchMode('voxels')}
+                className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-md text-[10px] font-semibold transition-all
+                    ${viewMode === 'voxels' 
+                        ? 'bg-zinc-800 text-white shadow-sm border border-zinc-700' 
+                        : 'text-zinc-500 hover:text-zinc-400 hover:bg-zinc-800/50'}
+                `}
+            >
+                <Box size={12} className={viewMode === 'voxels' ? "text-purple-500" : ""} /> Voxel
+            </button>
+            <button
+                onClick={() => switchMode('scene')}
+                className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-md text-[10px] font-semibold transition-all
+                    ${viewMode === 'scene' 
+                        ? 'bg-zinc-800 text-white shadow-sm border border-zinc-700' 
+                        : 'text-zinc-500 hover:text-zinc-400 hover:bg-zinc-800/50'}
+                `}
+            >
+                <Code size={12} className={viewMode === 'scene' ? "text-amber-500" : ""} /> Gen
+            </button>
+          </div>
+
+          {/* 3. Generation Control */}
+          <div className="space-y-2">
+            {viewMode === 'scene' ? (
+                 <button
+                    onClick={processSceneGeneration}
+                    disabled={!originalImage || isGeneratingScene}
+                    className={`
+                        w-full py-2.5 rounded-lg text-sm font-medium flex items-center justify-center gap-2 transition-all duration-300
+                        ${!originalImage 
+                        ? 'bg-zinc-800 text-zinc-600 cursor-not-allowed' 
+                        : isGeneratingScene 
+                            ? 'bg-zinc-800 text-zinc-300 cursor-wait'
+                            : 'bg-white text-black hover:bg-amber-50 shadow-lg shadow-white/5 hover:scale-[1.02] active:scale-[0.98]'
+                        }
+                    `}
+                >
+                    {isGeneratingScene ? (
+                    <Loader2 className="animate-spin" size={14} />
+                    ) : (
+                        <> <BrainCircuit size={14} /> Generate Scene </>
+                    )}
+                </button>
+            ) : (
+                <button
+                    onClick={processGeneration}
+                    disabled={!originalImage || isGenerating || !!pointCloudData}
+                    className={`
+                        w-full py-2.5 rounded-lg text-sm font-medium flex items-center justify-center gap-2 transition-all duration-300
+                        ${!originalImage 
+                        ? 'bg-zinc-800 text-zinc-600 cursor-not-allowed' 
+                        : isGenerating 
+                            ? 'bg-zinc-800 text-zinc-300 cursor-wait'
+                            : !!pointCloudData
+                                ? 'bg-zinc-800 text-zinc-400 border border-zinc-700'
+                                : 'bg-white text-black hover:bg-blue-50 shadow-lg shadow-white/5 hover:scale-[1.02] active:scale-[0.98]'
+                        }
+                    `}
+                >
+                    {isGenerating ? (
+                    <Loader2 className="animate-spin" size={14} />
+                    ) : !!pointCloudData ? (
+                        <> <Layers size={14} /> Generated </>
+                    ) : (
+                        <> <Wand2 size={14} /> Generate Cloud </>
+                    )}
+                </button>
+            )}
 
             {/* Export Button */}
-            {pointCloudData && (
+            {(pointCloudData || (viewMode === 'scene' && voxelSceneHtml)) && !isGeneratingScene && (
                 <button
                     onClick={handleExport}
                     className="w-full py-2 rounded-lg text-xs font-medium bg-zinc-800 text-zinc-300 hover:bg-zinc-700 border border-zinc-700 flex items-center justify-center gap-2 transition-colors"
                 >
-                    <Download size={12} /> Export Artefacto Cloud
+                    <Download size={12} /> {viewMode === 'scene' ? 'Export HTML Scene' : 'Export Artefacto Cloud'}
                 </button>
             )}
           </div>
 
-          {/* 3. Visual Adjustments */}
-          <div className="space-y-4 pt-4 border-t border-white/5">
-             <div className="flex items-center gap-2">
-                <Sliders size={14} className="text-zinc-400"/>
-                <label className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider">
-                  Visualization
-                </label>
+          {/* 4. Visual Adjustments */}
+          {viewMode !== 'scene' && (
+              <div className="space-y-4 pt-4 border-t border-white/5">
+                <div className="flex items-center gap-2">
+                    <Sliders size={14} className="text-zinc-400"/>
+                    <label className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider">
+                    Visualization ({viewMode === 'points' ? 'Points' : 'Voxels'})
+                    </label>
+                </div>
+
+                <div className="space-y-3">
+                    <div className="flex gap-2">
+                        <button 
+                            onClick={() => setShowBackground(!showBackground)}
+                            className={`flex-1 flex items-center justify-center gap-2 p-2 rounded-lg border transition-colors group
+                                ${showBackground ? 'bg-blue-500/20 border-blue-500/50 text-blue-300' : 'bg-zinc-800/50 border-zinc-700 text-zinc-400 hover:bg-zinc-800'}
+                            `}
+                        >
+                            <ImageIconLucide size={14} />
+                            <span className="text-[10px]">Backdrop</span>
+                        </button>
+                        <button 
+                            onClick={() => setAutoRotate(!autoRotate)}
+                            className={`flex-1 flex items-center justify-center gap-2 p-2 rounded-lg border transition-colors group
+                                ${autoRotate ? 'bg-emerald-500/20 border-emerald-500/50 text-emerald-300' : 'bg-zinc-800/50 border-zinc-700 text-zinc-400 hover:bg-zinc-800'}
+                            `}
+                        >
+                            <RotateCw size={14} className={autoRotate ? "animate-spin" : ""} />
+                            <span className="text-[10px]">Auto Spin</span>
+                        </button>
+                    </div>
+
+                    <div className="space-y-1">
+                        <div className="flex justify-between text-[10px] text-zinc-400">
+                            <span>Depth Scale (Z)</span>
+                            <span>{depthExaggeration.toFixed(1)}x</span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                            <Move3d size={12} className="text-zinc-500" />
+                            <input 
+                                type="range" min="0.1" max="3.0" step="0.1" value={depthExaggeration}
+                                onChange={(e) => setDepthExaggeration(parseFloat(e.target.value))}
+                                className="w-full h-1.5 bg-zinc-700 rounded-lg appearance-none cursor-pointer accent-purple-500 hover:accent-purple-400"
+                            />
+                        </div>
+                    </div>
+
+                    {/* Conditional Controls based on Mode */}
+                    {viewMode === 'points' ? (
+                        <>
+                            <div className="space-y-1">
+                                <div className="flex justify-between text-[10px] text-zinc-400">
+                                    <span>Point Size</span>
+                                    <span>{pointSize.toFixed(1)}</span>
+                                </div>
+                                <input 
+                                    type="range" min="0.1" max="5.0" step="0.1" value={pointSize}
+                                    onChange={(e) => setPointSize(parseFloat(e.target.value))}
+                                    className="w-full h-1.5 bg-zinc-700 rounded-lg appearance-none cursor-pointer accent-blue-500 hover:accent-blue-400"
+                                />
+                            </div>
+                            <div className="space-y-1">
+                                <div className="flex justify-between text-[10px] text-zinc-400">
+                                    <span>Density</span>
+                                    <span>{(samplingDensity * 100).toFixed(0)}%</span>
+                                </div>
+                                <input 
+                                    type="range" min="0.1" max="1.0" step="0.05" value={samplingDensity}
+                                    onChange={(e) => setSamplingDensity(parseFloat(e.target.value))}
+                                    onMouseUp={commitDensityChange}
+                                    onTouchEnd={commitDensityChange}
+                                    disabled={!pointCloudData}
+                                    className={`w-full h-1.5 bg-zinc-700 rounded-lg appearance-none cursor-pointer accent-emerald-500 hover:accent-emerald-400 disabled:opacity-50`}
+                                />
+                            </div>
+                        </>
+                    ) : (
+                        // VOXEL SETTINGS
+                        <div className="space-y-1">
+                            <div className="flex justify-between text-[10px] text-zinc-400">
+                                <span>Voxel Resolution</span>
+                                <span>{voxelResolution} px</span>
+                            </div>
+                            <input 
+                                type="range" min="32" max="150" step="2" value={voxelResolution}
+                                onChange={(e) => setVoxelResolution(parseInt(e.target.value))}
+                                disabled={!pointCloudData}
+                                className={`w-full h-1.5 bg-zinc-700 rounded-lg appearance-none cursor-pointer accent-purple-500 hover:accent-purple-400 disabled:opacity-50`}
+                            />
+                            <p className="text-[9px] text-zinc-500">Higher resolution = smaller cubes</p>
+                        </div>
+                    )}
+
+                </div>
+              </div>
+          )}
+
+          {viewMode === 'scene' && sceneThought && (
+             <div className="mt-4 p-3 bg-zinc-900/50 rounded-lg border border-amber-500/20 animate-in fade-in">
+                 <div className="flex items-center gap-2 text-amber-500 mb-2">
+                     <BrainCircuit size={14} className="animate-pulse" />
+                     <span className="text-[10px] font-semibold uppercase tracking-wider">Gemini Thinking</span>
+                 </div>
+                 <div className="text-[10px] text-zinc-400 font-mono leading-relaxed h-32 overflow-y-auto scrollbar-thin whitespace-pre-wrap">
+                     {sceneThought}
+                 </div>
              </div>
-
-             <div className="space-y-3">
-                <div className="flex gap-2">
-                     <button 
-                        onClick={() => setShowBackground(!showBackground)}
-                        className={`flex-1 flex items-center justify-center gap-2 p-2 rounded-lg border transition-colors group
-                            ${showBackground ? 'bg-blue-500/20 border-blue-500/50 text-blue-300' : 'bg-zinc-800/50 border-zinc-700 text-zinc-400 hover:bg-zinc-800'}
-                        `}
-                    >
-                        <ImageIconLucide size={14} />
-                        <span className="text-[10px]">Backdrop</span>
-                    </button>
-                    <button 
-                        onClick={() => setAutoRotate(!autoRotate)}
-                        className={`flex-1 flex items-center justify-center gap-2 p-2 rounded-lg border transition-colors group
-                             ${autoRotate ? 'bg-emerald-500/20 border-emerald-500/50 text-emerald-300' : 'bg-zinc-800/50 border-zinc-700 text-zinc-400 hover:bg-zinc-800'}
-                        `}
-                    >
-                        <RotateCw size={14} className={autoRotate ? "animate-spin" : ""} />
-                        <span className="text-[10px]">Auto Spin</span>
-                    </button>
-                </div>
-
-                <div className="space-y-1">
-                    <div className="flex justify-between text-[10px] text-zinc-400">
-                        <span>Depth Scale (Z)</span>
-                        <span>{depthExaggeration.toFixed(1)}x</span>
-                    </div>
-                     <div className="flex items-center gap-2">
-                         <Move3d size={12} className="text-zinc-500" />
-                        <input 
-                            type="range" min="0.1" max="3.0" step="0.1" value={depthExaggeration}
-                            onChange={(e) => setDepthExaggeration(parseFloat(e.target.value))}
-                            className="w-full h-1.5 bg-zinc-700 rounded-lg appearance-none cursor-pointer accent-purple-500 hover:accent-purple-400"
-                        />
-                    </div>
-                </div>
-
-                <div className="space-y-1">
-                    <div className="flex justify-between text-[10px] text-zinc-400">
-                        <span>Point Size</span>
-                        <span>{pointSize.toFixed(1)}</span>
-                    </div>
-                    <input 
-                        type="range" min="0.1" max="5.0" step="0.1" value={pointSize}
-                        onChange={(e) => setPointSize(parseFloat(e.target.value))}
-                        className="w-full h-1.5 bg-zinc-700 rounded-lg appearance-none cursor-pointer accent-blue-500 hover:accent-blue-400"
-                    />
-                </div>
-                <div className="space-y-1">
-                    <div className="flex justify-between text-[10px] text-zinc-400">
-                        <span>Density</span>
-                        <span>{(samplingDensity * 100).toFixed(0)}%</span>
-                    </div>
-                    <input 
-                        type="range" min="0.1" max="1.0" step="0.05" value={samplingDensity}
-                        onChange={(e) => handleDensityChange(parseFloat(e.target.value))}
-                        onMouseUp={commitDensityChange}
-                        onTouchEnd={commitDensityChange}
-                        disabled={!pointCloudData}
-                        className={`w-full h-1.5 bg-zinc-700 rounded-lg appearance-none cursor-pointer accent-emerald-500 hover:accent-emerald-400 disabled:opacity-50`}
-                    />
-                </div>
-             </div>
-          </div>
+          )}
           
            {/* Depth Preview Section */}
-           {depthImage && (
+           {depthImage && viewMode !== 'scene' && (
             <div className="space-y-3 pt-4 border-t border-white/5 animate-in fade-in slide-in-from-left-2">
                 <div className="flex justify-between items-center">
                      <label className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider flex items-center gap-2">
@@ -600,7 +785,7 @@ function App() {
         {/* Status Bar */}
         <div className="p-3 bg-zinc-950/50 border-t border-white/5 backdrop-blur">
           <div className="flex items-center gap-2">
-            <div className={`w-1.5 h-1.5 rounded-full ${statusMessage.includes("Ready") || statusMessage.includes("Success") ? "bg-emerald-500" : isGenerating ? "bg-amber-500 animate-pulse" : "bg-zinc-700"}`}></div>
+            <div className={`w-1.5 h-1.5 rounded-full ${statusMessage.includes("Ready") || statusMessage.includes("Success") || statusMessage.includes("Generated") ? "bg-emerald-500" : (isGenerating || isGeneratingScene) ? "bg-amber-500 animate-pulse" : "bg-zinc-700"}`}></div>
             <span className="text-[10px] text-zinc-400 font-medium truncate tracking-tight">
                 {statusMessage || "Waiting for image..."}
             </span>
@@ -611,20 +796,52 @@ function App() {
       {/* Main Viewport */}
       <div className="flex-1 relative bg-gradient-to-br from-black to-zinc-900 overflow-hidden group">
         <div className="absolute inset-0">
-             <PointCloudViewer 
-                data={pointCloudData} 
-                gestureRef={gestureRef} 
-                pointSize={pointSize} 
-                resetTrigger={resetTrigger} 
-                originalImage={originalImage}
-                showBackground={showBackground}
-                depthExaggeration={depthExaggeration}
-                autoRotate={autoRotate}
-             />
+             {viewMode === 'scene' ? (
+                 <div className="w-full h-full relative">
+                     {voxelSceneHtml ? (
+                         <iframe 
+                            ref={iframeRef}
+                            srcDoc={voxelSceneHtml} 
+                            className="w-full h-full border-0 bg-white" 
+                            sandbox="allow-scripts allow-same-origin"
+                            title="Generative Scene"
+                         />
+                     ) : (
+                         <div className="w-full h-full flex flex-col items-center justify-center text-zinc-600">
+                             {!isGeneratingScene && <Box size={48} className="mb-4 opacity-20" />}
+                             <p className="opacity-50 text-sm">
+                                 {isGeneratingScene ? "Generating Code..." : "Generate a voxel scene to preview here"}
+                             </p>
+                         </div>
+                     )}
+                 </div>
+             ) : (
+                 viewMode === 'points' ? (
+                     <PointCloudViewer 
+                        data={pointCloudData} 
+                        gestureRef={gestureRef} 
+                        pointSize={pointSize} 
+                        resetTrigger={resetTrigger} 
+                        originalImage={originalImage}
+                        showBackground={showBackground}
+                        depthExaggeration={depthExaggeration}
+                        autoRotate={autoRotate}
+                     />
+                 ) : (
+                     <VoxelViewer 
+                        data={pointCloudData} 
+                        gestureRef={gestureRef} 
+                        resetTrigger={resetTrigger} 
+                        depthExaggeration={depthExaggeration}
+                        autoRotate={autoRotate}
+                        voxelDensity={1}
+                     />
+                 )
+             )}
         </div>
 
         {/* Loading Overlay with Progress Bar */}
-        {(isGenerating || isProcessing3D) && (
+        {(isGenerating || isProcessing3D || isGeneratingScene) && (
             <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-black/80 backdrop-blur-sm animate-in fade-in duration-300">
                <div className="w-64 space-y-4 p-6 bg-zinc-900/50 border border-zinc-800 rounded-2xl shadow-2xl backdrop-blur-md">
                   <div className="flex items-center justify-between text-xs text-zinc-400 font-medium uppercase tracking-wider">
@@ -632,15 +849,17 @@ function App() {
                           <Loader2 size={12} className="animate-spin text-blue-500"/>
                           Processing
                       </span>
-                      <span className="text-zinc-300">{Math.round(progress)}%</span>
+                      {(!isGeneratingScene) && <span className="text-zinc-300">{Math.round(progress)}%</span>}
                   </div>
                   
-                  <div className="h-1.5 w-full bg-zinc-800 rounded-full overflow-hidden">
-                      <div 
-                        className="h-full bg-gradient-to-r from-blue-600 to-blue-400 transition-all duration-300 ease-out shadow-[0_0_10px_rgba(59,130,246,0.5)]"
-                        style={{ width: `${progress}%` }}
-                      />
-                  </div>
+                  {(!isGeneratingScene) && (
+                    <div className="h-1.5 w-full bg-zinc-800 rounded-full overflow-hidden">
+                        <div 
+                            className="h-full bg-gradient-to-r from-blue-600 to-blue-400 transition-all duration-300 ease-out shadow-[0_0_10px_rgba(59,130,246,0.5)]"
+                            style={{ width: `${progress}%` }}
+                        />
+                    </div>
+                  )}
                   
                   <p className="text-[10px] text-zinc-500 text-center animate-pulse">
                       {statusMessage}
@@ -649,7 +868,7 @@ function App() {
             </div>
         )}
         
-        {pointCloudData && !isGenerating && !isProcessing3D && (
+        {pointCloudData && !isGenerating && !isProcessing3D && viewMode !== 'scene' && (
           <>
              {/* Interactive Mode Badge */}
              <div className="absolute top-6 right-6 flex flex-col items-end gap-2 pointer-events-none">
@@ -672,7 +891,7 @@ function App() {
           </>
         )}
 
-        {(!originalImage && !isGenerating && !isProcessing3D) && (
+        {(!originalImage && !isGenerating && !isProcessing3D && !isGeneratingScene) && (
           <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
             <div className="text-center opacity-20 transform scale-95">
               <div className="w-32 h-32 rounded-full border border-zinc-700 flex items-center justify-center mx-auto mb-6 bg-zinc-900/30">

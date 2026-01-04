@@ -17,3 +17,5 @@ export interface ImageDimensions {
   width: number;
   height: number;
 }
+
+export type ViewMode = 'points' | 'voxels' | 'scene';

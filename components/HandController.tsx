@@ -88,9 +88,14 @@ const HandController = forwardRef<HandControllerHandle, HandControllerProps>(({ 
 
   // Cleanup function to stop everything
   const stopPipeline = () => {
-      if (requestRef.current) cancelAnimationFrame(requestRef.current);
+      if (requestRef.current) {
+        cancelAnimationFrame(requestRef.current);
+        requestRef.current = 0;
+      }
       if (handsRef.current) {
-          handsRef.current.close();
+          try {
+             handsRef.current.close();
+          } catch(e) { /* ignore */ }
           handsRef.current = null;
       }
       if (streamRef.current) {
@@ -187,7 +192,8 @@ const HandController = forwardRef<HandControllerHandle, HandControllerProps>(({ 
           try { 
               await handsRef.current.send({ image: videoRef.current }); 
           } catch (e) {
-              console.warn("Frame send dropped", e);
+              // Frame dropped, usually due to heavy load or context loss.
+              // We just ignore and try next frame.
           }
       }
       if (handsRef.current) {

@@ -46,7 +46,8 @@ export const resizeImage = (img: HTMLImageElement, maxSize: number = 512): HTMLC
 export const generatePointCloudFromImages = (
   colorCanvas: HTMLCanvasElement, 
   depthCanvas: HTMLCanvasElement,
-  samplingFactor: number = 1.0 // 0.0 to 1.0
+  samplingFactor: number = 1.0, // 0.0 to 1.0
+  isVoxelMode: boolean = false
 ): ProcessedPointCloud => {
   const width = colorCanvas.width;
   const height = colorCanvas.height;
@@ -83,7 +84,8 @@ export const generatePointCloudFromImages = (
       
       // Sampling check: Skip pixel if random value > factor
       // We skip calculation entirely for performance
-      if (samplingFactor < 1.0) {
+      // In voxel mode, we typically want full grid density unless specified otherwise
+      if (samplingFactor < 1.0 && !isVoxelMode) {
         if (Math.random() > samplingFactor) continue;
       }
 
@@ -95,18 +97,49 @@ export const generatePointCloudFromImages = (
       // Threshold check (optional): Skip purely black (background) pixels if desired
       // if (depthVal < 0.05) continue; 
 
-      // Color (Normalize 0-1) and Boost Vibrancy (1.3x)
-      // Doing this here saves millions of multiplications in the Vertex Shader per frame.
-      const r = (colorData[i] / 255) * 1.3;
-      const g = (colorData[i + 1] / 255) * 1.3;
-      const b = (colorData[i + 2] / 255) * 1.3;
+      let r = colorData[i] / 255;
+      let g = colorData[i + 1] / 255;
+      let b = colorData[i + 2] / 255;
 
       // X, Y, Z calculation
       const pX = (x - cx);
       const pY = -(y - cy);
       
       // Map 0..1 depth to Z range. 
-      const pZ = (depthVal - 0.5) * depthScale; 
+      let pZ = (depthVal - 0.5) * depthScale; 
+
+      if (isVoxelMode) {
+         // --- VOXEL ART STYLIZATION ---
+         
+         // 1. Depth Quantization
+         // Snap Z to integer grid matching X/Y pixel grid to create "layered" or "terraced" look
+         pZ = Math.round(pZ);
+
+         // 2. Color Quantization (Posterization)
+         // Reduce color palette to simulate retro 8-bit/16-bit look
+         const levels = 8.0; 
+         r = Math.floor(r * levels) / levels;
+         g = Math.floor(g * levels) / levels;
+         b = Math.floor(b * levels) / levels;
+
+         // 3. Vibrancy Boost
+         // Increase saturation to make voxels pop
+         const gray = 0.299*r + 0.587*g + 0.114*b;
+         const satBoost = 1.3;
+         r = gray + (r - gray) * satBoost;
+         g = gray + (g - gray) * satBoost;
+         b = gray + (b - gray) * satBoost;
+         
+      } else {
+         // --- POINT CLOUD STYLIZATION ---
+         // Just simple brightness/vibrancy boost
+         r *= 1.3; g *= 1.3; b *= 1.3;
+      }
+
+      // Clamp colors
+      r = Math.max(0, Math.min(1, r));
+      g = Math.max(0, Math.min(1, g));
+      b = Math.max(0, Math.min(1, b));
 
       positions[pIndex] = pX;
       positions[pIndex + 1] = pY;
