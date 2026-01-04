@@ -1,0 +1,7 @@
+{
+  "name": "DepthCloud Hand Control",
+  "description": "Convert 2D images to 3D depth point clouds using Gemini Nano Banana, and control the view with hand gestures via MediaPipe.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
