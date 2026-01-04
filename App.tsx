@@ -27,8 +27,8 @@ function App() {
   const [progress, setProgress] = useState<number>(0);
 
   // Visual settings
-  const [pointSize, setPointSize] = useState<number>(1.2);
-  const [samplingDensity, setSamplingDensity] = useState<number>(1.0);
+  const [pointSize, setPointSize] = useState<number>(0.2); // Default to 0.2
+  const [samplingDensity, setSamplingDensity] = useState<number>(0.5); // Default to 50%
   const [showBackground, setShowBackground] = useState<boolean>(false);
   const [depthExaggeration, setDepthExaggeration] = useState<number>(1.0);
   const [autoRotate, setAutoRotate] = useState<boolean>(false);
@@ -49,7 +49,8 @@ function App() {
   const gestureRef = useRef<HandGestures>({
     rotation: { x: 0, y: 0 },
     scale: 1,
-    isTracking: false
+    isTracking: false,
+    isExploding: false,
   });
   
   const handControllerRef = useRef<HandControllerHandle>(null);
@@ -90,7 +91,8 @@ function App() {
      gestureRef.current = {
         rotation: { x: 0, y: 0 },
         scale: 1.2,
-        isTracking: false
+        isTracking: false,
+        isExploding: false,
      };
   };
 

@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState, useCallback, useImperativeHandle, forwardRef } from 'react';
-import { ShieldAlert, Settings2, ScanFace, ZoomIn, Move3d, Minimize2, Maximize2, RefreshCw, RotateCcw, Eye, EyeOff, FlipHorizontal, Activity, Video, VideoOff } from 'lucide-react';
+import { ShieldAlert, Settings2, ScanFace, ZoomIn, Move3d, Minimize2, Maximize2, RefreshCw, RotateCcw, Eye, EyeOff, FlipHorizontal, Activity, Video, VideoOff, Bomb } from 'lucide-react';
 import { HandGestures } from '../types';
 
 interface Landmark {
@@ -59,6 +59,7 @@ const HandController = forwardRef<HandControllerHandle, HandControllerProps>(({ 
     rotation: { x: 0, y: 0 },
     scale: 1.2, 
     isTracking: false,
+    isExploding: false
   });
 
   // Persistent Zoom State
@@ -175,6 +176,7 @@ const HandController = forwardRef<HandControllerHandle, HandControllerProps>(({ 
         setTrackingState('lost');
         // Ensure tracking stops in parent
         gesturesRef.current.isTracking = false;
+        gesturesRef.current.isExploding = false;
         onUpdate(gesturesRef.current);
     }
     return () => stopPipeline();
@@ -220,6 +222,7 @@ const HandController = forwardRef<HandControllerHandle, HandControllerProps>(({ 
         const ZOOM_MAX_SPEED = currentSens === 'normal' ? 0.08 : 0.03;
 
         let rotX = 0, rotY = 0;
+        let isExploding = false;
         
         let rotateHand: Landmark[] | null = null;
         let zoomHand: Landmark[] | null = null;
@@ -240,6 +243,7 @@ const HandController = forwardRef<HandControllerHandle, HandControllerProps>(({ 
           });
 
           const shouldDraw = showDebugRef.current;
+          const isFingerUp = (hand: Landmark[], tipIdx: number, pipIdx: number) => hand[tipIdx].y < hand[pipIdx].y;
 
           // --- RIGHT HAND: ROTATION (JOYSTICK) ---
           if (rotateHand) {
@@ -263,105 +267,115 @@ const HandController = forwardRef<HandControllerHandle, HandControllerProps>(({ 
                 ctx.moveTo(width/2, height/2);
                 ctx.lineTo(indexTip.x * width, indexTip.y * height);
                 ctx.stroke();
-                
-                // Crosshair
-                ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
-                ctx.lineWidth = 1;
-                ctx.beginPath();
-                ctx.moveTo(width/2 - 10, height/2); ctx.lineTo(width/2 + 10, height/2);
-                ctx.moveTo(width/2, height/2 - 10); ctx.lineTo(width/2, height/2 + 10);
-                ctx.stroke();
             }
           }
 
-          // --- LEFT HAND: ZOOM THROTTLE ---
+          // --- LEFT HAND: ZOOM & EXPLODE ---
           if (zoomHand) {
             const zh = zoomHand as Landmark[];
-            if (shouldDraw) {
-                drawBoundingBox(ctx, zh, width, height, '#10b981', 'Left: Zoom');
-                drawSkeleton(ctx, zh, '#10b981', width, height);
-            }
-
-            const thumbTip = zh[4];
-            const indexTip = zh[8];
-            const wrist = zh[0];
-            const middleMCP = zh[9];
-
-            const handSize = Math.sqrt(
-                Math.pow(wrist.x - middleMCP.x, 2) + 
-                Math.pow(wrist.y - middleMCP.y, 2)
-            );
-
-            const pinchDist = Math.sqrt(
-                Math.pow(thumbTip.x - indexTip.x, 2) + 
-                Math.pow(thumbTip.y - indexTip.y, 2)
-            );
-
-            const rawRatio = pinchDist / (handSize || 0.1);
-            pinchRatioSmoothed.current = pinchRatioSmoothed.current * 0.90 + rawRatio * 0.10;
-            const ratio = pinchRatioSmoothed.current;
-
-            const THRESH_OUT = 0.35; 
-            const THRESH_IN = 0.75;  
             
-            let targetSpeed = 0;
-            let statusText = "Hold";
-            let gaugeColor = '#9ca3af';
+            let fingersUp = 0;
+            if (isFingerUp(zh, 8, 6)) fingersUp++;
+            if (isFingerUp(zh, 12, 10)) fingersUp++;
+            if (isFingerUp(zh, 16, 14)) fingersUp++;
+            if (isFingerUp(zh, 20, 18)) fingersUp++;
 
-            if (ratio < THRESH_OUT) {
-                const intensity = 1 - (ratio / THRESH_OUT); 
-                targetSpeed = -ZOOM_MAX_SPEED * Math.pow(intensity, 2);
-                statusText = "Zoom OUT";
-                gaugeColor = '#f43f5e'; 
-            } else if (ratio > THRESH_IN) {
-                const intensity = Math.min(1, (ratio - THRESH_IN) / 0.4);
-                targetSpeed = ZOOM_MAX_SPEED * Math.pow(intensity, 2);
-                statusText = "Zoom IN";
-                gaugeColor = '#34d399'; 
+            // Trigger Explosion if 3 or more fingers are up
+            if (fingersUp >= 3) {
+                isExploding = true;
             }
 
-            zoomVelocityRef.current = zoomVelocityRef.current * 0.85 + targetSpeed * 0.15;
-            if (Math.abs(zoomVelocityRef.current) < 0.0001) zoomVelocityRef.current = 0;
-
-            zoomLevelRef.current += zoomVelocityRef.current;
-            zoomLevelRef.current = Math.max(0.1, Math.min(zoomLevelRef.current, 12.0));
-
             if (shouldDraw) {
-                // Visual Gauge
-                const cx = thumbTip.x * width;
-                const cy = thumbTip.y * height - 30;
-                const barW = 60;
-                const barH = 6;
-                
-                if (ctx.roundRect) {
-                   ctx.beginPath();
-                   ctx.fillStyle = 'rgba(0,0,0,0.6)';
-                   ctx.roundRect(cx - barW/2, cy, barW, barH, 3);
-                   ctx.fill();
-                } else {
-                   ctx.fillStyle = 'rgba(0,0,0,0.6)';
-                   ctx.fillRect(cx - barW/2, cy, barW, barH);
-                }
-                
-                const neutralStart = 0.35 * barW; 
-                const neutralWidth = (0.75 - 0.35) * barW;
-                ctx.fillStyle = 'rgba(255,255,255,0.1)';
-                ctx.fillRect((cx - barW/2) + neutralStart, cy, neutralWidth, barH);
+                drawBoundingBox(ctx, zh, width, height, isExploding ? '#e11d48' : '#10b981', isExploding ? 'Left: EXPLODE' : 'Left: Zoom');
+                drawSkeleton(ctx, zh, isExploding ? '#e11d48' : '#10b981', width, height);
+            }
 
-                const normRatio = Math.min(1.2, Math.max(0, ratio)) / 1.2;
-                const indicatorX = cx - barW/2 + normRatio * barW;
+            // Only process Zoom if NOT exploding to avoid conflict
+            if (!isExploding) {
+                const thumbTip = zh[4];
+                const indexTip = zh[8];
+                const wrist = zh[0];
+                const middleMCP = zh[9];
+
+                const handSize = Math.sqrt(
+                    Math.pow(wrist.x - middleMCP.x, 2) + 
+                    Math.pow(wrist.y - middleMCP.y, 2)
+                );
+
+                const pinchDist = Math.sqrt(
+                    Math.pow(thumbTip.x - indexTip.x, 2) + 
+                    Math.pow(thumbTip.y - indexTip.y, 2)
+                );
+
+                const rawRatio = pinchDist / (handSize || 0.1);
+                pinchRatioSmoothed.current = pinchRatioSmoothed.current * 0.90 + rawRatio * 0.10;
+                const ratio = pinchRatioSmoothed.current;
+
+                const THRESH_OUT = 0.35; 
+                const THRESH_IN = 0.75;  
                 
-                ctx.fillStyle = gaugeColor;
-                ctx.beginPath();
-                ctx.arc(indicatorX, cy + barH/2, 5, 0, Math.PI * 2);
-                ctx.fill();
-                
-                ctx.fillStyle = '#ffffff';
-                ctx.font = 'bold 10px Inter';
-                ctx.textAlign = 'center';
-                ctx.fillText(statusText, cx, cy - 5);
-                ctx.fillText(`${zoomLevelRef.current.toFixed(1)}x`, cx, cy + 18);
-                ctx.textAlign = 'left';
+                let targetSpeed = 0;
+                let statusText = "Hold";
+                let gaugeColor = '#9ca3af';
+
+                if (ratio < THRESH_OUT) {
+                    const intensity = 1 - (ratio / THRESH_OUT); 
+                    targetSpeed = -ZOOM_MAX_SPEED * Math.pow(intensity, 2);
+                    statusText = "Zoom OUT";
+                    gaugeColor = '#f43f5e'; 
+                } else if (ratio > THRESH_IN) {
+                    const intensity = Math.min(1, (ratio - THRESH_IN) / 0.4);
+                    targetSpeed = ZOOM_MAX_SPEED * Math.pow(intensity, 2);
+                    statusText = "Zoom IN";
+                    gaugeColor = '#34d399'; 
+                }
+
+                zoomVelocityRef.current = zoomVelocityRef.current * 0.85 + targetSpeed * 0.15;
+                if (Math.abs(zoomVelocityRef.current) < 0.0001) zoomVelocityRef.current = 0;
+
+                zoomLevelRef.current += zoomVelocityRef.current;
+                zoomLevelRef.current = Math.max(0.1, Math.min(zoomLevelRef.current, 12.0));
+
+                if (shouldDraw) {
+                    // Visual Gauge
+                    const cx = thumbTip.x * width;
+                    const cy = thumbTip.y * height - 30;
+                    const barW = 60;
+                    const barH = 6;
+                    
+                    if (ctx.roundRect) {
+                        ctx.beginPath();
+                        ctx.fillStyle = 'rgba(0,0,0,0.6)';
+                        ctx.roundRect(cx - barW/2, cy, barW, barH, 3);
+                        ctx.fill();
+                    } else {
+                        ctx.fillStyle = 'rgba(0,0,0,0.6)';
+                        ctx.fillRect(cx - barW/2, cy, barW, barH);
+                    }
+                    
+                    const neutralStart = 0.35 * barW; 
+                    const neutralWidth = (0.75 - 0.35) * barW;
+                    ctx.fillStyle = 'rgba(255,255,255,0.1)';
+                    ctx.fillRect((cx - barW/2) + neutralStart, cy, neutralWidth, barH);
+
+                    const normRatio = Math.min(1.2, Math.max(0, ratio)) / 1.2;
+                    const indicatorX = cx - barW/2 + normRatio * barW;
+                    
+                    ctx.fillStyle = gaugeColor;
+                    ctx.beginPath();
+                    ctx.arc(indicatorX, cy + barH/2, 5, 0, Math.PI * 2);
+                    ctx.fill();
+                    
+                    ctx.fillStyle = '#ffffff';
+                    ctx.font = 'bold 10px Inter';
+                    ctx.textAlign = 'center';
+                    ctx.fillText(statusText, cx, cy - 5);
+                    ctx.fillText(`${zoomLevelRef.current.toFixed(1)}x`, cx, cy + 18);
+                    ctx.textAlign = 'left';
+                }
+            } else {
+                // If exploding, reset zoom velocity
+                zoomVelocityRef.current = 0;
             }
           } else {
             zoomVelocityRef.current = 0;
@@ -370,12 +384,14 @@ const HandController = forwardRef<HandControllerHandle, HandControllerProps>(({ 
           gesturesRef.current = {
             rotation: { x: rotX, y: rotY },
             scale: zoomLevelRef.current,
-            isTracking: true
+            isTracking: true,
+            isExploding: isExploding
           };
           
           setTrackingState('tracking');
         } else {
           gesturesRef.current.isTracking = false;
+          gesturesRef.current.isExploding = false;
           gesturesRef.current.rotation = { x: 0, y: 0 };
           setTrackingState('lost');
         }
@@ -584,6 +600,11 @@ const HandController = forwardRef<HandControllerHandle, HandControllerProps>(({ 
                       <span className="px-2 py-0.5 bg-emerald-500/90 text-[9px] text-white font-bold rounded-full shadow-lg flex items-center gap-1 backdrop-blur-sm">
                            <Minimize2 size={8} /> <Maximize2 size={8} /> Zoom
                       </span>
+                      {gesturesRef.current.isExploding && (
+                        <span className="px-2 py-0.5 bg-rose-500/90 text-[9px] text-white font-bold rounded-full shadow-lg flex items-center gap-1 backdrop-blur-sm animate-pulse">
+                           <Bomb size={8} /> EXPLODE
+                        </span>
+                      )}
                       <span className="px-2 py-0.5 bg-blue-500/90 text-[9px] text-white font-bold rounded-full shadow-lg flex items-center gap-1 backdrop-blur-sm">
                           <Activity size={8} /> Rotate
                       </span>

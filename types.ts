@@ -10,6 +10,7 @@ export interface HandGestures {
   rotation: { x: number; y: number };
   scale: number;
   isTracking: boolean;
+  isExploding: boolean;
 }
 
 export interface ImageDimensions {

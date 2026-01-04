@@ -18,45 +18,85 @@ interface PointCloudSceneProps {
 const PointCloudShader = {
   vertexShader: `
     uniform float uSizeScale; 
+    uniform float uTime;
+    uniform float uExplosion; 
     
     varying vec3 vColor;
     varying float vAlpha;
+    varying float vDepth;
+    varying vec3 vWorldPos;
+
+    // Pseudo-random function
+    float random(vec2 st) {
+        return fract(sin(dot(st.xy, vec2(12.9898,78.233))) * 43758.5453123);
+    }
 
     void main() {
       vColor = color;
       
-      vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+      vec3 pos = position;
+
+      // --- 1. EXPLOSION LOGIC (Expands outwards) ---
+      if (uExplosion > 0.0) {
+        float rnd = random(pos.xy + pos.z);
+        // Direction away from center (0,0,0) plus random noise
+        vec3 dir = normalize(pos) + vec3(sin(rnd * 10.0), cos(rnd * 15.0), sin(rnd * 5.0));
+        
+        // Move point outward continuously based on uniform
+        pos += dir * uExplosion * 20.0;
+        
+        // Add tumble rotation during explosion
+        float angle = uExplosion * 5.0 * (rnd - 0.5);
+        float s = sin(angle); float c = cos(angle);
+        float x = pos.x * c - pos.z * s;
+        float z = pos.x * s + pos.z * c;
+        pos.x = x; pos.z = z;
+      }
+
+      vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
       gl_Position = projectionMatrix * mvPosition;
 
+      vWorldPos = pos;
       float depth = -mvPosition.z;
+      vDepth = depth;
+
       // Prevent division by zero or negative
       float z = max(0.1, depth);
       
       // Dynamic Point Size based on distance
-      gl_PointSize = clamp(uSizeScale / z, 1.0, 100.0);
+      gl_PointSize = clamp(uSizeScale / z, 1.0, 150.0);
 
       // Fog Logic - Linear fade
-      float fogStart = 20.0;
-      float fogEnd = 80.0;
+      // INCREASED DISTANCE to prevent "lights out" effect when zooming out
+      float fogStart = 200.0;
+      float fogEnd = 800.0; 
       vAlpha = 1.0 - clamp((depth - fogStart) / (fogEnd - fogStart), 0.0, 1.0);
     }
   `,
   fragmentShader: `
     varying vec3 vColor;
     varying float vAlpha;
+    varying float vDepth;
+    varying vec3 vWorldPos;
 
     void main() {
-      // gl_PointCoord is 0.0 to 1.0
-      vec2 coord = gl_PointCoord * 2.0 - 1.0; // Map to -1..1
-      float distSq = dot(coord, coord);
+      // 1. SOFT PARTICLE SHAPE
+      vec2 coord = gl_PointCoord * 2.0 - 1.0; 
+      float dist = length(coord);
+      
+      // Soft glow falloff
+      float shapeAlpha = 1.0 - smoothstep(0.1, 1.0, dist); 
 
-      if (distSq >= 1.0) discard;
+      if (dist > 1.0) discard;
 
-      // Improved Interpolation:
-      float shapeAlpha = pow(1.0 - distSq, 2.0);
+      // 2. DEPTH TINT (Atmosphere)
+      // Fade distant points slightly to blueish/dark to enhance 3D feel
+      vec3 finalColor = vColor;
+      float atmosphere = smoothstep(20.0, 60.0, vDepth);
+      finalColor = mix(finalColor, vec3(0.05, 0.05, 0.1), atmosphere * 0.5);
 
-      // Combine with vertex alpha (fog) and apply a slight global transparency 
-      gl_FragColor = vec4(vColor, shapeAlpha * vAlpha * 0.95); 
+      // Final Alpha Output
+      gl_FragColor = vec4(finalColor, shapeAlpha * vAlpha * 0.95); 
     }
   `
 };
@@ -96,6 +136,9 @@ const PointCloudObject: React.FC<PointCloudSceneProps> = ({
   const controlsRef = useRef<any>(null); 
   const rotVelocity = useRef({ x: 0, y: 0 }); 
   
+  // Animation State Refs
+  const currentExplosion = useRef(0); 
+  
   const pixelRatio = useThree((state) => state.viewport.dpr);
   const size = useThree((state) => state.size);
   const { camera } = useThree();
@@ -110,13 +153,14 @@ const PointCloudObject: React.FC<PointCloudSceneProps> = ({
         if (controlsRef.current) {
             controlsRef.current.reset();
         }
+        // Also reset effects
+        currentExplosion.current = 0;
     }
   }, [resetTrigger, camera]);
 
   // Handle Point Size Updates Imperatively
   useEffect(() => {
     if (materialRef.current) {
-        // Adjust for the normalized scale (approx 20 units height)
         materialRef.current.uniforms.uSizeScale.value = pointSize * pixelRatio * size.height * 0.5;
         materialRef.current.uniformsNeedUpdate = true;
     }
@@ -130,51 +174,55 @@ const PointCloudObject: React.FC<PointCloudSceneProps> = ({
     return geo;
   }, [data]);
 
-  // Calculate scaling factor to normalize the object size in the view
-  // Target width ~ 20 world units
   const scaleFactor = useMemo(() => {
       const targetWidth = 20;
       return targetWidth / Math.max(data.width, 1);
   }, [data.width]);
 
-  // Calculate Background Depth
   const backgroundZ = useMemo(() => {
       const depthScale = Math.max(data.width, data.height) * 0.5;
-      return -(depthScale * 0.5) - 20; // Place it slightly behind the furthest point
+      return -(depthScale * 0.5) - 20; 
   }, [data.width, data.height]);
 
 
   useFrame((state, delta) => {
     if (!groupRef.current) return;
+    
+    // Update Shader Time
+    if (materialRef.current) {
+        materialRef.current.uniforms.uTime.value = state.clock.elapsedTime;
+        
+        const gestures = gestureRef.current;
+        
+        // --- EXPLOSION LOGIC (Accumulative) ---
+        if (gestures.isExploding) {
+            // While held, add to the explosion value so it expands infinitely
+            currentExplosion.current += delta * 2.0; 
+        } else {
+            // When released, snap back elasticity
+            currentExplosion.current = THREE.MathUtils.lerp(currentExplosion.current, 0.0, delta * 3.0);
+        }
+        materialRef.current.uniforms.uExplosion.value = currentExplosion.current;
+    }
 
     const gestures = gestureRef.current;
     const damping = 1.0 - Math.exp(-10.0 * delta);
 
-    // Apply scale dynamically including depth exaggeration on Z axis
-    const currentScale = groupRef.current.scale.x; // Use X as base since X/Y are uniform
-    
-    // Determine Target Base Scale (Gesture vs Default)
+    const currentScale = groupRef.current.scale.x; 
     let targetBaseScale = scaleFactor * (gestures.scale || 1.2);
-    
-    // Smooth Scale Transition
     const newBaseScale = THREE.MathUtils.lerp(currentScale, targetBaseScale, damping * 2.0);
     
-    // Apply: X/Y = Base, Z = Base * Exaggeration
     groupRef.current.scale.set(newBaseScale, newBaseScale, newBaseScale * depthExaggeration);
 
-    // Rotation Logic
     if (gestures.isTracking) {
-      rotVelocity.current.y = THREE.MathUtils.lerp(rotVelocity.current.y, gestures.rotation.y, damping);
-      rotVelocity.current.x = THREE.MathUtils.lerp(rotVelocity.current.x, gestures.rotation.x, damping);
+        rotVelocity.current.y = THREE.MathUtils.lerp(rotVelocity.current.y, gestures.rotation.y, damping);
+        rotVelocity.current.x = THREE.MathUtils.lerp(rotVelocity.current.x, gestures.rotation.x, damping);
 
-      groupRef.current.rotation.y += rotVelocity.current.y * delta * 15.0;
-      groupRef.current.rotation.x += rotVelocity.current.x * delta * 15.0;
-
+        groupRef.current.rotation.y += rotVelocity.current.y * delta * 15.0;
+        groupRef.current.rotation.x += rotVelocity.current.x * delta * 15.0;
     } else {
-        // Idle / Auto Rotate
         rotVelocity.current.x = THREE.MathUtils.lerp(rotVelocity.current.x, 0, damping);
         
-        // If AutoRotate is ON, maintain a constant spin, otherwise dampen to 0
         const targetRotY = autoRotate ? 0.2 : 0;
         rotVelocity.current.y = THREE.MathUtils.lerp(rotVelocity.current.y, targetRotY, damping * 0.5);
         
@@ -185,13 +233,13 @@ const PointCloudObject: React.FC<PointCloudSceneProps> = ({
 
   const uniforms = useMemo(() => ({
     uSizeScale: { value: pointSize * pixelRatio * size.height * 0.5 },
+    uTime: { value: 0 },
+    uExplosion: { value: 0 },
   }), []); 
 
   return (
     <Center>
       <group ref={groupRef}>
-        
-        {/* Points */}
         <points geometry={geometry}>
           <shaderMaterial
             ref={materialRef}
@@ -200,13 +248,12 @@ const PointCloudObject: React.FC<PointCloudSceneProps> = ({
             fragmentShader={PointCloudShader.fragmentShader}
             transparent={true}
             depthWrite={true}
-            blending={THREE.NormalBlending} 
+            blending={THREE.AdditiveBlending} 
             vertexColors={true}
             uniforms={uniforms}
           />
         </points>
 
-        {/* Background Image Plane attached to the group */}
         {originalImage && (
             <React.Suspense fallback={null}>
                 <BackgroundPlane 
@@ -232,63 +279,25 @@ const PointCloudObject: React.FC<PointCloudSceneProps> = ({
   );
 };
 
-interface ViewerProps {
+interface PointCloudViewerProps {
   data: ProcessedPointCloud | null;
   gestureRef: React.MutableRefObject<HandGestures>;
   pointSize: number;
-  resetTrigger?: number; 
-  originalImage?: string | null;
-  showBackground?: boolean;
-  depthExaggeration?: number;
-  autoRotate?: boolean;
+  resetTrigger: number;
+  originalImage: string | null;
+  showBackground: boolean;
+  depthExaggeration: number;
+  autoRotate: boolean;
 }
 
-const PointCloudViewer: React.FC<ViewerProps> = ({ 
-  data, 
-  gestureRef, 
-  pointSize, 
-  resetTrigger = 0,
-  originalImage = null,
-  showBackground = false,
-  depthExaggeration = 1.0,
-  autoRotate = false
-}) => {
-  return (
-    <div className="w-full h-full bg-slate-900 shadow-inner">
-      <Canvas 
-        camera={{ position: [0, 0, 35], fov: 50 }}
-        dpr={Math.min(2, window.devicePixelRatio)} 
-        gl={{ 
-          antialias: false,
-          powerPreference: "high-performance",
-          alpha: false,
-          stencil: false,
-          depth: true
-        }}
-      >
-        <color attach="background" args={['#050505']} />
-        
-        {data ? (
-          <PointCloudObject 
-            data={data} 
-            gestureRef={gestureRef} 
-            pointSize={pointSize} 
-            resetTrigger={resetTrigger}
-            originalImage={originalImage}
-            showBackground={showBackground}
-            depthExaggeration={depthExaggeration}
-            autoRotate={autoRotate}
-          />
-        ) : (
-          <mesh>
-             <gridHelper args={[20, 20, 0x222222, 0x111111]} />
-          </mesh>
-        )}
-        
-        {!data && <OrbitControls makeDefault />}
+const PointCloudViewer: React.FC<PointCloudViewerProps> = (props) => {
+  if (!props.data) return null;
 
-      </Canvas>
-    </div>
+  return (
+    <Canvas camera={{ position: [0, 0, 100], fov: 60 }} dpr={typeof window !== 'undefined' ? window.devicePixelRatio : 1}>
+      <color attach="background" args={['#000000']} />
+      <PointCloudObject {...props} data={props.data} />
+    </Canvas>
   );
 };
 
