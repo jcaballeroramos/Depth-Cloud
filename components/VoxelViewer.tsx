@@ -1,8 +1,28 @@
 import React, { useRef, useMemo, useEffect } from 'react';
-import { Canvas, useFrame, useThree } from '@react-three/fiber';
+import { Canvas, useFrame, useThree, useLoader } from '@react-three/fiber';
 import { OrbitControls, Center } from '@react-three/drei';
 import * as THREE from 'three';
 import { ProcessedPointCloud, HandGestures } from '../types';
+
+// Background Image Plane Component (mismo que en PointCloudViewer)
+const BackgroundPlane = ({ imageSrc, visible, width, height, depthOffset }: { imageSrc: string, visible: boolean, width: number, height: number, depthOffset: number }) => {
+  const texture = useLoader(THREE.TextureLoader, imageSrc);
+  
+  if (!visible) return null;
+
+  return (
+    <mesh position={[0, 0, depthOffset]}>
+      <planeGeometry args={[width, height]} />
+      <meshBasicMaterial 
+        map={texture} 
+        transparent 
+        opacity={0.4} 
+        depthWrite={false} 
+        side={THREE.DoubleSide} 
+      />
+    </mesh>
+  );
+};
 
 interface VoxelObjectProps {
   data: ProcessedPointCloud;
@@ -10,6 +30,8 @@ interface VoxelObjectProps {
   depthExaggeration: number;
   autoRotate: boolean;
   voxelSize: number;
+  originalImage: string | null;
+  showBackground: boolean;
 }
 
 const VoxelObject: React.FC<VoxelObjectProps> = ({ 
@@ -17,7 +39,9 @@ const VoxelObject: React.FC<VoxelObjectProps> = ({
   gestureRef, 
   depthExaggeration,
   autoRotate,
-  voxelSize
+  voxelSize,
+  originalImage,
+  showBackground
 }) => {
   const meshRef = useRef<THREE.InstancedMesh>(null);
   const groupRef = useRef<THREE.Group>(null);
@@ -26,6 +50,12 @@ const VoxelObject: React.FC<VoxelObjectProps> = ({
   
   const shaderRef = useRef<THREE.Shader>(null);
   const currentExplosion = useRef(0);
+
+  // Calculate background Z position
+  const backgroundZ = useMemo(() => {
+    const depthScale = Math.max(data.width, data.height) * 0.5;
+    return -(depthScale * 0.5) - 20; 
+  }, [data.width, data.height]);
 
   // Initialize Voxels
   useEffect(() => {
@@ -52,7 +82,7 @@ const VoxelObject: React.FC<VoxelObjectProps> = ({
     meshRef.current.instanceMatrix.needsUpdate = true;
     if (meshRef.current.instanceColor) meshRef.current.instanceColor.needsUpdate = true;
 
-  }, [data, depthExaggeration]); 
+  }, [data, depthExaggeration, dummy]); 
 
   const customMaterial = useMemo(() => {
     // Shinier material for "Lego" aesthetic that catches light better
@@ -157,6 +187,19 @@ const VoxelObject: React.FC<VoxelObjectProps> = ({
         >
             <boxGeometry args={[0.92, 0.92, 0.92]} />
         </instancedMesh>
+
+        {/* Background Plane - igual que en PointCloudViewer */}
+        {originalImage && (
+            <React.Suspense fallback={null}>
+                <BackgroundPlane 
+                    imageSrc={originalImage} 
+                    visible={showBackground} 
+                    width={data.width}
+                    height={data.height}
+                    depthOffset={backgroundZ}
+                />
+            </React.Suspense>
+        )}
       </group>
     </Center>
   );
@@ -168,7 +211,9 @@ interface VoxelViewerProps {
   resetTrigger: number;
   depthExaggeration: number;
   autoRotate: boolean;
-  voxelDensity: number; 
+  voxelDensity: number;
+  originalImage?: string | null;
+  showBackground?: boolean;
 }
 
 const VoxelViewer: React.FC<VoxelViewerProps> = (props) => {
@@ -224,6 +269,8 @@ const VoxelViewer: React.FC<VoxelViewerProps> = (props) => {
         depthExaggeration={props.depthExaggeration}
         autoRotate={props.autoRotate}
         voxelSize={1.0}
+        originalImage={props.originalImage || null}
+        showBackground={props.showBackground || false}
       />
       
       <OrbitControls makeDefault enableZoom={true} enablePan={true} rotateSpeed={0.5} zoomSpeed={0.7} />
